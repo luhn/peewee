@@ -4810,6 +4810,9 @@ class AsyncDatabase(PostgresqlDatabase):
     def select(self, model):
         return SelectQuery(self, model)
 
+    def get(self, model, *args):
+        return self.select(model).where(*args).get()
+
     def update(self, model, _data=None, **update):
         fdict = _data or {}
         fdict.update([(model._meta.fields[f], update[f]) for f in update])
