@@ -1948,18 +1948,17 @@ class ResultIterator(object):
         self.qrw = qrw
         self._idx = 0
 
-    def next(self):
+    async def __anext__(self):
         if self._idx < self.qrw._ct:
             obj = self.qrw._result_cache[self._idx]
         elif not self.qrw._populated:
-            obj = self.qrw.iterate()
+            obj = await self.qrw.iterate()
             self.qrw._result_cache.append(obj)
             self.qrw._ct += 1
         else:
             raise StopIteration
         self._idx += 1
         return obj
-    __next__ = next
 
 
 class QueryResultWrapper(object):
@@ -1985,7 +1984,7 @@ class QueryResultWrapper(object):
         else:
             self.column_meta = self.join_meta = None
 
-    def __iter__(self):
+    async def __aiter__(self):
         if self._populated:
             return iter(self._result_cache)
         else:
@@ -2002,13 +2001,13 @@ class QueryResultWrapper(object):
     def process_row(self, row):
         return row
 
-    def iterate(self):
-        row = self.cursor.fetchone()
+    async def iterate(self):
+        row = await self.cursor.fetchone()
         if not row:
             self._populated = True
             if not getattr(self.cursor, 'name', None):
                 self.cursor.close()
-            raise StopIteration
+            raise StopAsyncIteration
         elif not self._initialized:
             self.initialize(self.cursor.description)
             self._initialized = True
@@ -2018,20 +2017,19 @@ class QueryResultWrapper(object):
         while True:
             yield self.iterate()
 
-    def next(self):
+    async def __anext__(self):
         if self._idx < self._ct:
             inst = self._result_cache[self._idx]
             self._idx += 1
             return inst
         elif self._populated:
-            raise StopIteration
+            raise StopAsyncIteration
 
-        obj = self.iterate()
+        obj = await self.iterate()
         self._result_cache.append(obj)
         self._ct += 1
         self._idx += 1
         return obj
-    __next__ = next
 
     def fill_cache(self, n=None):
         n = n or float('Inf')
@@ -2397,11 +2395,11 @@ class Query(Node):
     """Base class representing a database query on one or more tables."""
     require_commit = True
 
-    def __init__(self, model_class):
+    def __init__(self, database, model_class):
         super(Query, self).__init__()
 
         self.model_class = model_class
-        self.database = model_class._meta.database
+        self.database = database
 
         self._dirty = True
         self._query_ctx = model_class
@@ -2413,7 +2411,7 @@ class Query(Node):
         return '%s %s %s' % (self.model_class, sql, params)
 
     def clone(self):
-        query = type(self)(self.model_class)
+        query = type(self)(self.database, self.model_class)
         query.database = self.database
         return self._clone_attributes(query)
 
@@ -2550,12 +2548,15 @@ class Query(Node):
     def sql(self):
         raise NotImplementedError
 
-    def _execute(self):
+    async def _execute(self):
         sql, params = self.sql()
-        return self.database.execute_sql(sql, params, self.require_commit)
+        return await self.database.execute_sql(sql, params, self.require_commit)
 
     def execute(self):
         raise NotImplementedError
+
+    def __await__(self):
+        return self.execute().__await__()
 
     def scalar(self, as_tuple=False, convert=False):
         if convert:
@@ -2618,9 +2619,10 @@ class RawQuery(Query):
 class SelectQuery(Query):
     _node_type = 'select_query'
 
-    def __init__(self, model_class, *selection):
-        super(SelectQuery, self).__init__(model_class)
-        self.require_commit = self.database.commit_select
+    def __init__(self, database, model_class, *selection):
+        super(SelectQuery, self).__init__(database, model_class)
+        # self.require_commit = self.database.commit_select
+        self.require_commit = False
         self.__select(*selection)
         self._from = None
         self._group_by = None
@@ -2851,22 +2853,25 @@ class SelectQuery(Query):
         else:
             return ModelQueryResultWrapper
 
-    def execute(self):
+    async def execute(self):
         if self._dirty or self._qr is None:
             model_class = self.model_class
             query_meta = self.get_query_meta()
             ResultWrapper = self._get_result_wrapper()
-            self._qr = ResultWrapper(model_class, self._execute(), query_meta)
+            query = await self._execute()
+            self._qr = ResultWrapper(model_class, query, query_meta)
             self._dirty = False
             return self._qr
         else:
             return self._qr
 
-    def __iter__(self):
-        return iter(self.execute())
+    async def __aiter__(self):
+        query = await self.execute()
+        return await query.__aiter__()
 
-    def iterator(self):
-        return iter(self.execute().iterator())
+    async def iterator(self):
+        query = await self.execute()
+        return await query.iterator().__aiter__()
 
     def __getitem__(self, value):
         res = self.execute()
@@ -2924,12 +2929,12 @@ class CompoundSelect(SelectQuery):
             return ModelQueryResultWrapper
 
 class _WriteQuery(Query):
-    def __init__(self, model_class):
+    def __init__(self, database, model_class):
         self._returning = None
         self._tuples = False
         self._dicts = False
         self._qr = None
-        super(_WriteQuery, self).__init__(model_class)
+        super(_WriteQuery, self).__init__(database, model_class)
 
     def _clone_attributes(self, query):
         query = super(_WriteQuery, self)._clone_attributes(query)
@@ -2976,18 +2981,19 @@ class _WriteQuery(Query):
                 return DictQueryResultWrapper
         return NaiveQueryResultWrapper
 
-    def _execute_with_result_wrapper(self):
+    async def _execute_with_result_wrapper(self):
         ResultWrapper = self.get_result_wrapper()
         meta = (self._returning, {self.model_class: []})
-        self._qr = ResultWrapper(self.model_class, self._execute(), meta)
+        query = await self._execute()
+        self._qr = ResultWrapper(self.model_class, query, meta)
         return self._qr
 
 
 class UpdateQuery(_WriteQuery):
-    def __init__(self, model_class, update=None):
+    def __init__(self, database, model_class, update=None):
         self._update = update
         self._on_conflict = None
-        super(UpdateQuery, self).__init__(model_class)
+        super(UpdateQuery, self).__init__(database, model_class)
 
     def _clone_attributes(self, query):
         query = super(UpdateQuery, self)._clone_attributes(query)
@@ -3004,13 +3010,14 @@ class UpdateQuery(_WriteQuery):
     def sql(self):
         return self.compiler().generate_update(self)
 
-    def execute(self):
+    async def execute(self):
         if self._returning is not None and self._qr is None:
-            return self._execute_with_result_wrapper()
+            return await self._execute_with_result_wrapper()
         elif self._qr is not None:
             return self._qr
         else:
-            return self.database.rows_affected(self._execute())
+            query = await self._execute()
+            return self.database.rows_affected(query)
 
     def __iter__(self):
         if not self.model_class._meta.database.returning_clause:
@@ -3023,9 +3030,9 @@ class UpdateQuery(_WriteQuery):
         return iter(self.execute().iterator())
 
 class InsertQuery(_WriteQuery):
-    def __init__(self, model_class, field_dict=None, rows=None,
+    def __init__(self, database, model_class, field_dict=None, rows=None,
                  fields=None, query=None, validate_fields=False):
-        super(InsertQuery, self).__init__(model_class)
+        super(InsertQuery, self).__init__(database, model_class)
 
         self._upsert = False
         self._is_multi_row_insert = rows is not None or query is not None
@@ -3123,7 +3130,7 @@ class InsertQuery(_WriteQuery):
         else:
             return last_id
 
-    def execute(self):
+    async def execute(self):
         insert_with_loop = (
             self._is_multi_row_insert and
             self._query is None and
@@ -3137,10 +3144,10 @@ class InsertQuery(_WriteQuery):
         elif self._qr is not None:
             return self._qr
         else:
-            cursor = self._execute()
+            cursor = await self._execute()
             if not self._is_multi_row_insert:
                 if self.database.insert_returning:
-                    pk_row = cursor.fetchone()
+                    pk_row = await cursor.fetchone()
                     meta = self.model_class._meta
                     clean_data = [
                         field.python_value(column)
@@ -3161,13 +3168,14 @@ class DeleteQuery(_WriteQuery):
     def sql(self):
         return self.compiler().generate_delete(self)
 
-    def execute(self):
+    async def execute(self):
         if self._returning is not None and self._qr is None:
-            return self._execute_with_result_wrapper()
+            return await self._execute_with_result_wrapper()
         elif self._qr is not None:
             return self._qr
         else:
-            return self.database.rows_affected(self._execute())
+            query = await self._execute()
+            return self.database.rows_affected(query)
 
 
 IndexMetadata = namedtuple(
@@ -4784,3 +4792,29 @@ def sort_models_topologically(models):
     for m in sorted(models, key=names, reverse=True):
         dfs(m)
     return list(reversed(ordering))  # want parents first in output ordering
+
+
+class AsyncDatabase(PostgresqlDatabase):
+    """
+    Quick and dirty asynchronous database.
+
+    """
+    def __init__(self, conn):
+        self._conn = conn
+
+    def select(self, model):
+        return SelectQuery(self, model)
+
+    def insert(self, model, data):
+        return InsertQuery(self, model, data)
+
+    def update(self, model, data):
+        return UpdateQuery(self, model, data)
+
+    def delete(self, model):
+        return DeleteQuery(self, model)
+
+    async def execute_sql(self, sql, params, require_commit):
+        c = await self._conn.cursor()
+        await c.execute(sql, params)
+        return c
