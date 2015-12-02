@@ -2808,10 +2808,11 @@ class SelectQuery(Query):
         clone._select = [SQL('1')]
         return bool(clone.scalar())
 
-    def get(self):
+    async def get(self):
         clone = self.paginate(1, 1)
         try:
-            return clone.execute().next()
+            query = await clone.execute()
+            return await query.__anext__()
         except StopIteration:
             raise self.model_class.DoesNotExist(
                 'Instance matching query does not exist:\nSQL: %s\nPARAMS: %s'
@@ -4551,7 +4552,7 @@ class Model(with_metaclass(BaseModel)):
                 setattr(self, key, getattr(self, key))
                 field_dict[key] = self._data[key]
 
-    def save(self, force_insert=False, only=None):
+    async def save(self, database, force_insert=False, only=None):
         field_dict = dict(self._data)
         if self._meta.primary_key is not False:
             pk_field = self._meta.primary_key
@@ -4575,12 +4576,16 @@ class Model(with_metaclass(BaseModel)):
                     field_dict.pop(pk_part_name, None)
             else:
                 field_dict.pop(pk_field.name, None)
-            rows = self.update(**field_dict).where(self._pk_expr()).execute()
+            rows = await database.update(self.__class__, **field_dict)\
+                .where(self._pk_expr())\
+                .execute()
         elif pk_field is None:
-            self.insert(**field_dict).execute()
+            await database.insert(self.__class__, **field_dict).execute()
             rows = 1
         else:
-            pk_from_cursor = self.insert(**field_dict).execute()
+            pk_from_cursor = await database.insert(
+                self.__class__, **field_dict,
+            ).execute()
             if pk_from_cursor is not None:
                 pk_value = pk_from_cursor
             self._set_pk_value(pk_value)
@@ -4805,14 +4810,21 @@ class AsyncDatabase(PostgresqlDatabase):
     def select(self, model):
         return SelectQuery(self, model)
 
-    def insert(self, model, data):
-        return InsertQuery(self, model, data)
+    def update(self, model, _data=None, **update):
+        fdict = _data or {}
+        fdict.update([(model._meta.fields[f], update[f]) for f in update])
+        return UpdateQuery(self, model, fdict)
 
-    def update(self, model, data):
-        return UpdateQuery(self, model, data)
+    def insert(self, model, _data=None, **insert):
+        fdict = _data or {}
+        fdict.update([(model._meta.fields[f], insert[f]) for f in insert])
+        return InsertQuery(self, model, fdict)
 
     def delete(self, model):
         return DeleteQuery(self, model)
+
+    def save(self, obj):
+        return obj.save(self)
 
     async def execute_sql(self, sql, params, require_commit):
         c = await self._conn.cursor()
